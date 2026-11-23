@@ -21,6 +21,8 @@ class AudioCodec:
         self.opus_encoder = None
         self.opus_decoder = None
         self._is_closing = False
+        # 打断监视器参考信号回调：sink(pcm_bytes, sample_rate)，None 为关
+        self._ref_sink = None
 
         self._initialize_audio()
         set_audio_codec(self)
@@ -105,9 +107,40 @@ class AudioCodec:
         """解码并播放"""
         try:
             pcm_data = self.decode_audio(opus_data)  # 解码
+            # 参考信号 tap：把解码后的 PCM 副本喂给打断监视器作 AEC
+            # 参考（见 core/services/audio/bargein.py）。tap 异常绝不
+            # 影响播放主流程。
+            if self._ref_sink is not None:
+                try:
+                    sample_rate, _ = self._get_server_audio_params()
+                    self._ref_sink(pcm_data, sample_rate)
+                except Exception:
+                    pass
             self.output_stream.write(pcm_data)  # 播放
         except Exception:
             pass
+
+    def set_reference_sink(self, sink):
+        """设置参考信号回调 sink(pcm_bytes, sample_rate)；None 表示关闭。"""
+        self._ref_sink = sink
+
+    def create_monitor_stream(self):
+        """为打断监视器创建一条独立输入流（不启动）。
+
+        与主 input_stream 相互独立地注册到 GlobalStream：SPEAKING 期
+        主上行被停掉时，监视流仍能收取麦克风音频供 AEC/VAD 判定。
+        """
+        if not self.audio:
+            return None
+        return self.audio.open(
+            format=AudioConfig.FORMAT,
+            channels=AudioConfig.CHANNELS,
+            rate=AudioConfig.SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=512,
+            input_device_index=MyAudio.get_input_device_index(self.audio),
+            start=False,
+        )
 
     def decode_audio(self, opus_data):
         """解码音频数据"""

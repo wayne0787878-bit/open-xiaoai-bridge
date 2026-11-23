@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 
 import open_xiaoai_server
 
@@ -47,6 +48,18 @@ def _load_notify_sound() -> bytes | None:
 
 
 _NOTIFY_PCM = _load_notify_sound()
+
+# 打断监视器灰度开关（环境变量 XIAOZHI_BARGEIN）：
+#   未设/0/off → off（不装配监视器，行为与现行版一致）
+#   observe/log → observe（监视器运行并记录判定，不真打断）
+#   1/true/yes/on → on（命中后发 {"type":"abort"} 并续听；服务端忽略 wake_word_detected）
+_BARGEIN_ENV = os.environ.get("XIAOZHI_BARGEIN", "").strip().lower()
+if _BARGEIN_ENV in ("1", "true", "yes", "on"):
+    BARGEIN_MODE = "on"
+elif _BARGEIN_ENV in ("observe", "log"):
+    BARGEIN_MODE = "observe"
+else:
+    BARGEIN_MODE = "off"
 
 
 class XiaoZhi:
@@ -81,6 +94,15 @@ class XiaoZhi:
         self._vad_future: asyncio.Future | None = None
         self._tts_stop_future: asyncio.Future | None = None
         self._is_first_round = False
+
+        # Barge-in monitor state（灰度开关关闭时保持 None/False，不装配）
+        self._bargein_monitor = None
+        self._bargein_future: asyncio.Future | None = None
+        self._in_wakeup_session = False
+        logger.info(
+            f"[XiaoZhi] Barge-in monitor mode: {BARGEIN_MODE} "
+            f"(XIAOZHI_BARGEIN={os.environ.get('XIAOZHI_BARGEIN') or 'not set'})"
+        )
 
     def set_app(self, app):
         """Set reference to main app."""
@@ -122,6 +144,18 @@ class XiaoZhi:
                 if not self._audio_codec.output_stream.is_active():
                     self._audio_codec.output_stream.start_stream()
 
+        # 打断监视器（灰度）：仅在 SPEAKING 期运行，其余状态停。
+        # 监视流与主 input_stream 独立，不受上面的流管理影响。
+        monitor = getattr(self, "_bargein_monitor", None)
+        if monitor is not None:
+            try:
+                if state == DeviceState.SPEAKING:
+                    monitor.start()
+                else:
+                    monitor.stop()
+            except Exception:
+                pass
+
     # Connection management
 
     async def connect(self):
@@ -160,7 +194,56 @@ class XiaoZhi:
             logger.warning(f"[XiaoZhi] Failed to initialize audio: {e}")
             return
 
+        # 打断监视器装配（灰度开关非 off 时）；装配失败只禁用监视器，
+        # 不影响主流程。
+        if BARGEIN_MODE != "off":
+            try:
+                from core.services.audio.bargein import BargeInMonitor
+
+                monitor = BargeInMonitor(
+                    on_trigger=self._on_bargein_detected,
+                    observe=(BARGEIN_MODE == "observe"),
+                )
+                stream = self._audio_codec.create_monitor_stream()
+                if stream is not None:
+                    monitor.attach_stream(stream)
+                    self._audio_codec.set_reference_sink(monitor.feed_reference_pcm)
+                    self._bargein_monitor = monitor
+                    logger.info(
+                        f"[XiaoZhi] Barge-in monitor ready (mode={BARGEIN_MODE})"
+                    )
+                else:
+                    logger.warning(
+                        "[XiaoZhi] Barge-in monitor stream unavailable, monitor disabled"
+                    )
+            except Exception as e:
+                logger.warning(f"[XiaoZhi] Failed to set up barge-in monitor: {e}")
+                self._bargein_monitor = None
+
         threading.Thread(target=self._audio_input_trigger, daemon=True).start()
+
+    def _on_bargein_detected(self, preroll: bytes):
+        """打断监视器命中回调（监视器线程调用）。
+
+        仅在唤醒会话正等待 TTS 结束时才兑现：把消回声预缓冲经
+        session loop 交给 _wait_tts_stop_or_bargein。其余时机
+        （无会话/未在等待）忽略，不改变任何现有行为。
+        """
+        future = self._bargein_future
+        accepted = (
+            self._in_wakeup_session
+            and self._session_loop is not None
+            and future is not None
+            and not future.done()
+        )
+        logger.info(
+            "[XiaoZhi] Barge-in trigger: "
+            f"preroll_bytes={len(preroll)} accepted={accepted} "
+            f"in_session={self._in_wakeup_session}",
+            module="XiaoZhi",
+        )
+        if accepted:
+            self._session_loop.call_soon_threadsafe(future.set_result, preroll)
 
     # Protocol callbacks
 
@@ -358,6 +441,8 @@ class XiaoZhi:
             self._session_loop.call_soon_threadsafe(self._vad_future.cancel)
         if self._session_loop and self._tts_stop_future and not self._tts_stop_future.done():
             self._session_loop.call_soon_threadsafe(self._tts_stop_future.cancel)
+        if self._session_loop and self._bargein_future and not self._bargein_future.done():
+            self._session_loop.call_soon_threadsafe(self._bargein_future.cancel)
 
         self.set_device_state(DeviceState.IDLE)
 
@@ -380,6 +465,7 @@ class XiaoZhi:
         vad = get_vad()
         codec = get_audio_codec()
         speaker = get_speaker()
+        self._in_wakeup_session = True
 
         try:
             while True:
@@ -419,33 +505,46 @@ class XiaoZhi:
                 await self.send_start_listening(ListeningMode.MANUAL)
                 self.set_device_state(DeviceState.LISTENING)
 
-                # Wait for silence
-                vad.resume("silence")
-                result = await self._wait_vad_event()
-                if result:
-                    event_type, _ = result
-                    logger.debug(f"VAD detected silence, stop listening", module="XiaoZhi")
+                # 对话轮次：等待静音 → 停止监听 → 等待 TTS 结束。
+                # 播报期间若被真人打断（barge-in，灰度开启时），
+                # _wait_tts_stop_or_bargein 内部已完成 abort + 续听，
+                # 本轮直接回到等待静音，不退出会话；barge-in 关闭时
+                # 该等待与原 _wait_tts_stop 行为一致，内层只走一遍。
+                tts_finished = False
+                while True:
+                    # Wait for silence
+                    vad.resume("silence")
+                    result = await self._wait_vad_event()
+                    if result:
+                        event_type, _ = result
+                        logger.debug(f"VAD detected silence, stop listening", module="XiaoZhi")
 
-                # Prepare TTS stop future before sending stop_listening,
-                # so we don't miss the tts_stop event.
-                self._tts_stop_future = self._session_loop.create_future()
+                    # Prepare TTS stop future before sending stop_listening,
+                    # so we don't miss the tts_stop event.
+                    self._tts_stop_future = self._session_loop.create_future()
 
-                await self.send_stop_listening()
-                self.set_device_state(DeviceState.IDLE)
+                    await self.send_stop_listening()
+                    self.set_device_state(DeviceState.IDLE)
 
-                # Wait for TTS to finish, then start next round
-                tts_finished = await self._wait_tts_stop(timeout=30)
+                    # Wait for TTS to finish (or barge-in), then start next round
+                    outcome = await self._wait_tts_stop_or_bargein(timeout=30)
+                    if outcome == "bargein":
+                        continue
+                    tts_finished = outcome == "tts"
+                    break
                 if not tts_finished:
                     break
         except asyncio.CancelledError:
             logger.debug("Wakeup session cancelled", module="XiaoZhi")
             raise
         finally:
+            self._in_wakeup_session = False
             if vad:
                 vad.pause()
             self.set_device_state(DeviceState.IDLE)
             self._vad_future = None
             self._tts_stop_future = None
+            self._bargein_future = None
 
     async def _wait_vad_event(self, timeout=None):
         """Wait for a VAD event (speech/silence)."""
@@ -489,6 +588,128 @@ class XiaoZhi:
             return False
         finally:
             self._tts_stop_future = None
+
+    async def _wait_tts_stop_or_bargein(self, timeout=None):
+        """等待 TTS 结束或播报中打断，返回 "tts" / "timeout" / "bargein"。
+
+        barge-in 未装配（灰度关闭）时与 _wait_tts_stop 行为一致，
+        仅返回形式不同。返回 "bargein" 时已完成 abort + 续听
+        （见 _relisten_after_bargein），调用方直接回到等待静音。
+        """
+        if not self._tts_stop_future:
+            self._tts_stop_future = self._session_loop.create_future()
+        tts_future = self._tts_stop_future
+
+        if self._bargein_monitor is None:
+            try:
+                await asyncio.wait_for(tts_future, timeout=timeout)
+                return "tts"
+            except asyncio.TimeoutError:
+                return "timeout"
+            finally:
+                if self._tts_stop_future is tts_future:
+                    self._tts_stop_future = None
+
+        self._bargein_future = self._session_loop.create_future()
+        bargein_future = self._bargein_future
+        try:
+            done, _ = await asyncio.wait(
+                {tts_future, bargein_future},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if bargein_future in done and not bargein_future.cancelled():
+                await self._relisten_after_bargein(
+                    bargein_future.result(), tts_future
+                )
+                return "bargein"
+            if tts_future in done:
+                if tts_future.cancelled():
+                    # 与 _wait_tts_stop 的 wait_for 语义对齐：
+                    # 外部 stop 取消 future 时按会话取消处理
+                    raise asyncio.CancelledError()
+                return "tts"
+            return "timeout"
+        finally:
+            if self._tts_stop_future is tts_future:
+                self._tts_stop_future = None
+            if self._bargein_future is bargein_future:
+                self._bargein_future = None
+            if not bargein_future.done():
+                bargein_future.cancel()
+
+    async def _await_on_app_loop(self, coro):
+        """在 MainApp.loop 上执行协程并等待其完成。
+
+        websocket 连接归 MainApp.loop 所有（协议的音频发送都在该
+        loop 上）；从 session loop 直接 await 协议发送，会与 app
+        loop 的音频发送并发写同一条连接，帧可能损坏——2026-11-23
+        on 档实测：连续第二次打断后服务端以 1007（invalid frame
+        payload）关闭连接。本方法与既有用户动作路径（start/stop/
+        abort 均经 run_coroutine_threadsafe 投递 app loop）对齐。
+        """
+        loop = self._app.loop if self._app else None
+        if loop is None or not loop.is_running():
+            return await coro
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return await asyncio.wrap_future(future)
+
+    async def _relisten_after_bargein(self, preroll: bytes, tts_future):
+        """打断命中后的处理：中止播报 → 等 tts stop → 带预缓冲续听。
+
+        - abort 用 AbortReason.ABORT：协议层把 reason 直接写进消息
+          type 字段，本机小智服务端只认 {"type": "abort"}，收到
+          {"type": "wake_word_detected"} 只会记「未知类型」并忽略
+          （2026-11-23 17:08 服务端日志实测）——曾导致 tts stop 等待
+          烧满 3s 超时、relisten 完成时用户短句早已说完；
+        - 等待被中止 TTS 的 tts stop（短超时兜底），并消费掉它，
+          避免迟到的 stop 误触发下一轮等待；
+        - 消回声预缓冲经 set_speech_frames 作为新一轮开头送出，
+          与 VAD 唤醒时的语音缓冲走同一条通道。
+        """
+        t0 = time.monotonic()
+        logger.info(
+            "[XiaoZhi] Barge-in relisten begin: "
+            f"preroll_bytes={len(preroll)}",
+            module="XiaoZhi",
+        )
+        await self._await_on_app_loop(
+            self.send_abort_speaking(AbortReason.ABORT)
+        )
+        logger.info(
+            "[XiaoZhi] Barge-in abort sent: "
+            f"type={AbortReason.ABORT} dt_ms={(time.monotonic() - t0) * 1000:.0f}",
+            module="XiaoZhi",
+        )
+        if tts_future is not None and not tts_future.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(tts_future), timeout=3)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        logger.info(
+            "[XiaoZhi] Barge-in tts-stop wait done: "
+            f"dt_ms={(time.monotonic() - t0) * 1000:.0f}",
+            module="XiaoZhi",
+        )
+        if preroll:
+            set_speech_frames(preroll)
+            logger.info(
+                "[XiaoZhi] Barge-in preroll queued: "
+                f"bytes={len(preroll)} dt_ms={(time.monotonic() - t0) * 1000:.0f}",
+                module="XiaoZhi",
+            )
+        codec = get_audio_codec()
+        if codec:
+            codec.input_stream.start_stream()
+        await self._await_on_app_loop(
+            self.send_start_listening(ListeningMode.MANUAL)
+        )
+        self.set_device_state(DeviceState.LISTENING)
+        logger.info(
+            "[XiaoZhi] Barge-in listen sent: type=listen state=start "
+            f"mode=manual dt_ms={(time.monotonic() - t0) * 1000:.0f}",
+            module="XiaoZhi",
+        )
 
     async def _play_notify(self, speaker):
         """Play the listening-ready notification sound."""
