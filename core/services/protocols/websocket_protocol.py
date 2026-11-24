@@ -272,7 +272,8 @@ class WebsocketProtocol(Protocol):
                 await self.websocket.send(frame)
         except Exception as exc:
             logger.error(
-                f"[xiaozhi-esp32-server] Failed to send audio: {type(exc).__name__}: {exc}"
+                f"[xiaozhi-esp32-server] audio send failed {safe_ws_failure('send_audio', exc)}",
+                module="xiaozhi-esp32-server",
             )
 
     async def send_text(self, message: str):
