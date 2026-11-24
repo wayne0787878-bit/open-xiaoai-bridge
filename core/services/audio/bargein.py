@@ -60,8 +60,8 @@ PROCESS_BUDGET_SAMPLES = 512  # 32ms @16kHz
 # 标定之后待处理队列的上限。比预滚更老的样本已经送不出去，先处理它们
 # 会把当前这句话推迟数秒。超出部分丢最老的，保留尾部。
 LIVE_PENDING_CAP = PREROLL_SAMPLES
-# 有声参考一直凑不满 0.35s 时，实际送进 AEC 的样本到这个长度也结束预热。
-# 现场第一次过门的检测出现在已处理约 7 万样本、arm_voiced 只有 2816 的时候。
+# 已经对齐、并且确实写在参考 tap 里的样本达到这个长度仍无有声参考时，
+# 结束预热。对齐下标还没落到已写入区间时读回来的是补零，不能计入这段。
 MAX_WARMUP_AEC_SAMPLES = int(0.60 * SAMPLE_RATE)
 # 正常 float 满幅是 1。峰值远高于此是滤波器发散，不是麦克风语音。
 AEC_DIVERGE_PEAK = 4.0
@@ -302,6 +302,8 @@ class BargeInCore:
         self._backlog_capped_logged = False
         self._live_drop_unlogged = 0
         self._divergence_logged = False
+        self._valid_ref_samples = 0  # 对齐后确实落在参考 tap 内的样本
+        self._ref_hold_logged = False
         self._calib_off = 0  # 最近一次标定评估的尾窗起点（本期麦克风下标）
         self.calibrated = False
         self.degraded = False
@@ -335,23 +337,49 @@ class BargeInCore:
         self._aec_origin = self._mic_proc
         self._aec_origin_set = True
 
-    def _note_arm_block(self, ref_blk: np.ndarray):
-        """预热看已经送进 AEC 的样本，不看最新喂入下标。
+    def _aligned_ref_in_tap(self) -> bool:
+        """当前这块麦克风对齐到的参考，是否大部分已经写在 tap 里。
 
-        有声参考满 ARM_SAMPLES 就结束。参考一直偏安静或对齐偏差很大时，
-        实际处理样本达到 MAX_WARMUP_AEC_SAMPLES 也结束，避免整段积压
-        都算在预热里。
+        下标在 tap 起点之前、或还没被 write_audio 写入时，read() 补 0。
+        那种 0 不是播报静音，不能用来结束预热。
+        """
+        start = self._ref_base + (self._mic_proc - AEC_BLOCK_LEN) - self.align
+        end = start + AEC_BLOCK_LEN
+        written = self._tap.total_written
+        if end <= 0 or start >= written:
+            return False
+        covered = min(end, written) - max(start, 0)
+        return covered >= AEC_BLOCK_LEN // 2
+
+    def _note_arm_block(self, ref_blk: np.ndarray):
+        """预热只统计已经对齐且落在参考 tap 内的样本。
+
+        有声参考满 ARM_SAMPLES 就结束。tap 里的参考持续安静达到
+        MAX_WARMUP_AEC_SAMPLES 也结束。对齐位置还在 tap 已写入区间
+        之外时不计数：那里读到的是补零，滤波器还没有看见播报。
         """
         if self._arm_until is not None:
             return
+        if not self._aligned_ref_in_tap():
+            if not self._ref_hold_logged:
+                self._ref_hold_logged = True
+                logger.info(
+                    "[BargeIn] Warm-up holding: aligned reference is outside "
+                    f"the written tap; align={self.align} "
+                    f"ref_written={self._tap.total_written - self._ref_base} "
+                    f"{self._coords()}",
+                    module="BargeIn",
+                )
+            return
+        self._valid_ref_samples += len(ref_blk)
         if _dbfs(ref_blk) >= REF_VOICED_DBFS:
             self._arm_voiced += len(ref_blk)
         voiced_done = self._arm_voiced >= ARM_SAMPLES
-        time_done = self._aec_samples >= MAX_WARMUP_AEC_SAMPLES
-        if not voiced_done and not time_done:
+        quiet_done = self._valid_ref_samples >= MAX_WARMUP_AEC_SAMPLES
+        if not voiced_done and not quiet_done:
             return
         self._arm_until = self._mic_proc
-        why = "voiced-ref" if voiced_done else "aec-sample-cap"
+        why = "voiced-ref" if voiced_done else "valid-ref-quiet"
         logger.info(
             f"[BargeIn] Warm-up ended ({why}) after "
             f"{self._arm_voiced} voiced-ref samples: {self._coords()}",

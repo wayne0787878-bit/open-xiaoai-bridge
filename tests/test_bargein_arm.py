@@ -26,6 +26,7 @@ from core.services.audio.bargein import (
     ARM_SAMPLES,
     CALIB_MIN_SAMPLES,
     LIVE_PENDING_CAP,
+    MAX_WARMUP_AEC_SAMPLES,
     PROCESS_BUDGET_SAMPLES,
     PREROLL_SAMPLES,
     SAFETY_MARGIN,
@@ -269,8 +270,6 @@ class BargeInArmCoordinateTest(unittest.TestCase):
         ])
         tap, core = _new_core(_energy_vad(-12.0))
         self.assertIsNone(_feed(core, tap, mic, ref, chunk=2048))
-        self.assertIsNotNone(core._arm_until)
-        self.assertEqual(0, core._arm_voiced)
         self.assertFalse(core.triggered)
 
     def test_long_delay_calibration_and_reset(self):
@@ -446,6 +445,46 @@ class BargeInArmCoordinateTest(unittest.TestCase):
         self.assertIsNone(event)
         self.assertFalse(core.triggered)
         self.assertIn("diverged", "\n".join(logs.output))
+
+    def test_large_delay_does_not_end_warmup_on_zero_fill(self):
+        """对齐点还在参考 tap 之前时，0.6s 样本上限不能把预热放行。
+
+        几何和一次失败播报相同量级：估计时延约 1.4s，丢到 1.5s 尾部后
+        proc 仍小于 align。旧逻辑会在 arm_voiced 仍为 0 时结束预热。
+        """
+        delay = 23000
+        n = delay + CALIB_MIN_SAMPLES + 400
+        ref = _noise(n, 0.12, 51)
+        mic = _delayed(ref, delay, 0.65)
+        tap, core = _new_core(_energy_vad())
+        core.feed_mic(mic)
+        tap.push_samples(ref)
+        for _ in range(80):
+            core.process_available()
+            if core.calibrated and core._aec_samples > MAX_WARMUP_AEC_SAMPLES:
+                break
+        self.assertTrue(core.calibrated)
+        self.assertGreater(core.align, MAX_WARMUP_AEC_SAMPLES)
+        self.assertLess(core._mic_proc, core.align)
+        self.assertIsNone(core._arm_until)
+        self.assertEqual(0, core._arm_voiced)
+        self.assertFalse(core.triggered)
+
+    def test_bargein_still_fires_after_aligned_reference_is_seen(self):
+        """预热改成等待真实参考之后，对齐完成仍要能自然打断，不能靠关掉打断保播放。"""
+        delay = 20000
+        echo_n = delay + CALIB_MIN_SAMPLES + 8000
+        ref = _noise(echo_n, 0.12, 52)
+        mic = _delayed(ref, delay, 0.6)
+        tap, core = _new_core(_energy_vad())
+        self.assertIsNone(_feed(core, tap, mic, ref, chunk=4096))
+        self.assertTrue(core.calibrated)
+        self.assertIsNotNone(core._arm_until)
+        self.assertGreaterEqual(core._arm_voiced, ARM_SAMPLES)
+        speech_n = int(0.45 * SR)
+        speech_ref = _noise(speech_n, 0.08, 53)
+        speech_mic = _delayed(speech_ref, min(delay, speech_n // 5), 0.15) + _noise(speech_n, 0.55, 54)
+        self.assertEqual("bargein", _feed(core, tap, speech_mic, speech_ref, chunk=speech_n))
 
 
 class AbortMessageRegressionTest(unittest.TestCase):
