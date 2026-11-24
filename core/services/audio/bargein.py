@@ -53,7 +53,18 @@ ARM_SAMPLES = int(0.35 * SAMPLE_RATE)  # 有声参考送进 AEC 后的收敛预�
 AEC_FILTER_LEN = 2048
 AEC_BLOCK_LEN = 256
 REF_RING_CAPACITY = 8 * SAMPLE_RATE  # 参考环形缓冲 8s
-PREROLL_SAMPLES = int(1.5 * SAMPLE_RATE)  # 消回声预缓冲 1.5s（原 1s；2026-11-23 17:08 实测短句在 relisten 完成前已说完，预滚需多覆盖句头）
+PREROLL_SAMPLES = int(1.5 * SAMPLE_RATE)  # 消回声预缓冲 1.5s（原 1s；短句在 relisten 完成前已说完，预滚需多覆盖句头）
+# 一次 process_available 最多处理这么多麦克风样本。现场一次调用在
+# fed 不变时连续跑了约 7 万样本、墙钟 6 秒以上，播报和 abort 都挤在后面。
+PROCESS_BUDGET_SAMPLES = 512  # 32ms @16kHz
+# 标定之后待处理队列的上限。比预滚更老的样本已经送不出去，先处理它们
+# 会把当前这句话推迟数秒。超出部分丢最老的，保留尾部。
+LIVE_PENDING_CAP = PREROLL_SAMPLES
+# 有声参考一直凑不满 0.35s 时，实际送进 AEC 的样本到这个长度也结束预热。
+# 现场第一次过门的检测出现在已处理约 7 万样本、arm_voiced 只有 2816 的时候。
+MAX_WARMUP_AEC_SAMPLES = int(0.60 * SAMPLE_RATE)
+# 正常 float 满幅是 1。峰值远高于此是滤波器发散，不是麦克风语音。
+AEC_DIVERGE_PEAK = 4.0
 
 # 打断判定
 VAD_THRESHOLD = 0.5  # 监视器专用高置信阈值（与会话 VAD 的阈值独立）
@@ -285,8 +296,12 @@ class BargeInCore:
         self._arm_voiced = 0  # 已送进 AEC 的有声参考样本数
         self._aec_origin = 0  # 本段 AEC 第一个样本的处理坐标
         self._aec_origin_set = False
+        self._aec_samples = 0  # 实际送进 AEC 的样本数（不含直接丢弃的积压）
+        self._emit_end = 0  # 最近一块 AEC 输出对应的处理坐标终点
         self._out_count = 0  # 已产出的 AEC 输出样本数
         self._backlog_capped_logged = False
+        self._live_drop_unlogged = 0
+        self._divergence_logged = False
         self._calib_off = 0  # 最近一次标定评估的尾窗起点（本期麦克风下标）
         self.calibrated = False
         self.degraded = False
@@ -309,8 +324,8 @@ class BargeInCore:
             f"fed={self._mic_fed} proc={self._mic_proc} "
             f"backlog={self._mic_fed - self._mic_proc} "
             f"pending={len(self._mic_pending)} "
-            f"aec_origin={self._aec_origin} arm_until={arm} "
-            f"arm_voiced={self._arm_voiced} "
+            f"aec_origin={self._aec_origin} aec_samples={self._aec_samples} "
+            f"arm_until={arm} arm_voiced={self._arm_voiced} "
             f"seg={self._seg_start}:{self._seg_end}"
         )
 
@@ -321,19 +336,51 @@ class BargeInCore:
         self._aec_origin_set = True
 
     def _note_arm_block(self, ref_blk: np.ndarray):
-        """用已经送进 AEC 的有声参考累计预热，不用最新喂入下标。"""
+        """预热看已经送进 AEC 的样本，不看最新喂入下标。
+
+        有声参考满 ARM_SAMPLES 就结束。参考一直偏安静或对齐偏差很大时，
+        实际处理样本达到 MAX_WARMUP_AEC_SAMPLES 也结束，避免整段积压
+        都算在预热里。
+        """
         if self._arm_until is not None:
             return
-        if _dbfs(ref_blk) < REF_VOICED_DBFS:
+        if _dbfs(ref_blk) >= REF_VOICED_DBFS:
+            self._arm_voiced += len(ref_blk)
+        voiced_done = self._arm_voiced >= ARM_SAMPLES
+        time_done = self._aec_samples >= MAX_WARMUP_AEC_SAMPLES
+        if not voiced_done and not time_done:
             return
-        self._arm_voiced += len(ref_blk)
-        if self._arm_voiced >= ARM_SAMPLES:
-            self._arm_until = self._mic_proc
-            logger.info(
-                "[BargeIn] Warm-up ended after "
-                f"{self._arm_voiced} voiced-ref samples: {self._coords()}",
-                module="BargeIn",
-            )
+        self._arm_until = self._mic_proc
+        why = "voiced-ref" if voiced_done else "aec-sample-cap"
+        logger.info(
+            f"[BargeIn] Warm-up ended ({why}) after "
+            f"{self._arm_voiced} voiced-ref samples: {self._coords()}",
+            module="BargeIn",
+        )
+
+    def _cap_live_pending(self):
+        """标定后只保留最近 LIVE_PENDING_CAP 个待处理样本。"""
+        extra = len(self._mic_pending) - LIVE_PENDING_CAP
+        if extra <= 0:
+            return
+        drop = extra - (extra % AEC_BLOCK_LEN)
+        if drop <= 0:
+            return
+        self._mic_pending = self._mic_pending[drop:]
+        self._mic_proc += drop
+        self._emit_end = self._mic_proc
+        self._clean_pending = np.zeros(0, dtype=np.float32)
+        self._live_drop_unlogged += drop
+        if self._live_drop_unlogged < SAMPLE_RATE // 2:
+            return
+        logger.info(
+            "[BargeIn] Live backlog capped at "
+            f"{LIVE_PENDING_CAP} samples "
+            f"({LIVE_PENDING_CAP / SAMPLE_RATE:.1f}s): "
+            f"dropped={self._live_drop_unlogged} {self._coords()}",
+            module="BargeIn",
+        )
+        self._live_drop_unlogged = 0
 
     def _in_warmup_seg(self) -> bool:
         end = self._seg_end if self._seg_end is not None else self._mic_proc
@@ -417,6 +464,7 @@ class BargeInCore:
                             module="BargeIn",
                         )
                 return None
+        self._cap_live_pending()
         return self._process_aligned()
 
     def _degrade_or_fallback(self, reason: str):
@@ -487,36 +535,57 @@ class BargeInCore:
         )
 
     def _process_aligned(self):
-        # 以 AEC 块长推进：麦克风块 p 处的参考取 tap[ref_base + p - align]。
-        # 预热命中只清本段，同一轮积压里更后面的真人语音仍可触发，
-        # 不把已经排队的样本丢掉。
+        # 以 AEC 块长推进，但单次调用有预算。麦克风块 p 处的参考取
+        # tap[ref_base + p - align]。预热命中只清本段，预算内更后面的
+        # 真人语音仍可触发。
         self._ensure_aec_origin()
-        while (
+        processed = 0
+        while processed < PROCESS_BUDGET_SAMPLES and (
             len(self._mic_pending) >= AEC_BLOCK_LEN
             or len(self._clean_pending) >= VAD_FRAME
         ):
-            if len(self._mic_pending) >= AEC_BLOCK_LEN:
+            if (
+                len(self._mic_pending) >= AEC_BLOCK_LEN
+                and processed < PROCESS_BUDGET_SAMPLES
+            ):
                 blk = self._mic_pending[:AEC_BLOCK_LEN]
                 self._mic_pending = self._mic_pending[AEC_BLOCK_LEN:]
                 ref_blk = self._tap.read(
                     self._ref_base + self._mic_proc - self.align, AEC_BLOCK_LEN
                 )
                 self._mic_proc += AEC_BLOCK_LEN
+                self._aec_samples += AEC_BLOCK_LEN
+                processed += AEC_BLOCK_LEN
                 self._note_arm_block(ref_blk)
                 out = self._aec.process(blk, ref_blk)
                 if len(out):
+                    peak = float(np.max(np.abs(out)))
+                    if peak > AEC_DIVERGE_PEAK:
+                        self._aec.reset()
+                        out = np.zeros_like(out)
+                        if not self._divergence_logged:
+                            self._divergence_logged = True
+                            logger.warning(
+                                "[BargeIn] AEC output diverged "
+                                f"(peak={peak:.1f}); filter reset; {self._coords()}",
+                                module="BargeIn",
+                            )
                     self._out_count += len(out)
                     self._clean_pending = np.concatenate([self._clean_pending, out])
                     self._preroll = np.concatenate([self._preroll, out])
                     if len(self._preroll) > PREROLL_SAMPLES:
                         self._preroll = self._preroll[-PREROLL_SAMPLES:]
+                self._emit_end = self._mic_proc
             ev = self._vad_step()
             if ev == "bargein":
                 if self._in_warmup_seg():
                     self._suppress_warmup_hit()
                     continue
                 return "bargein"
-            if len(self._mic_pending) < AEC_BLOCK_LEN:
+            if (
+                len(self._mic_pending) < AEC_BLOCK_LEN
+                and len(self._clean_pending) < VAD_FRAME
+            ):
                 break
         return None
 
@@ -524,7 +593,7 @@ class BargeInCore:
         while len(self._clean_pending) >= VAD_FRAME:
             frame = self._clean_pending[:VAD_FRAME]
             self._clean_pending = self._clean_pending[VAD_FRAME:]
-            frame_end = self._aec_origin + self._out_count - len(self._clean_pending)
+            frame_end = self._emit_end - len(self._clean_pending)
             frame_start = frame_end - VAD_FRAME
             warming = self._arm_until is None or frame_end < self._arm_until
             frame_db = _dbfs(frame)
@@ -663,6 +732,8 @@ class BargeInMonitor:
                 data = b""
             if data:
                 self._core.feed_mic(to_float(np.frombuffer(data, dtype=np.int16)))
+            pending = len(self._core._mic_pending)
+            if data or pending >= AEC_BLOCK_LEN:
                 ev = self._core.process_available()
                 if ev == "bargein" and not self._fired:
                     self._fired = True
@@ -679,5 +750,8 @@ class BargeInMonitor:
                             logger.error(
                                 f"[BargeIn] on_trigger failed: {exc}", module="BargeIn"
                             )
+                # 积压还在时让出一会儿，避免 AEC 持续占满 CPU，播放下发进不了主循环。
+                if len(self._core._mic_pending) >= AEC_BLOCK_LEN:
+                    time.sleep(0.001)
             else:
                 time.sleep(0.01)

@@ -22,8 +22,11 @@ if str(ROOT) not in sys.path:
 from core.aec import to_float
 from core.services.audio.bargein import (
     AEC_BLOCK_LEN,
+    AEC_DIVERGE_PEAK,
     ARM_SAMPLES,
     CALIB_MIN_SAMPLES,
+    LIVE_PENDING_CAP,
+    PROCESS_BUDGET_SAMPLES,
     PREROLL_SAMPLES,
     SAFETY_MARGIN,
     SAMPLE_RATE,
@@ -72,26 +75,39 @@ def _always_speech(_frame: np.ndarray) -> float:
     return 1.0
 
 
+def _drain(core: BargeInCore, max_rounds: int = 20000):
+    """按监视线程的方式把预算循环跑完。单次 process_available 不再吞掉整段积压。"""
+    for _ in range(max_rounds):
+        pending_before = len(core._mic_pending)
+        proc_before = core._mic_proc
+        event = core.process_available()
+        if event:
+            return event
+        if (
+            core._mic_proc == proc_before
+            and len(core._mic_pending) == pending_before
+        ):
+            return None
+    return None
+
+
 def _feed(core: BargeInCore, tap: ReferenceTap, mic: np.ndarray, ref: np.ndarray,
           chunk: int, pause: float = 0.0):
     """按块喂入等长的麦克风/参考。返回第一次 bargein，没有则 None。"""
     if len(mic) != len(ref):
         raise AssertionError(f"mic/ref length {len(mic)} != {len(ref)}")
     pos = 0
-    event = None
     while pos < len(mic):
         step = min(chunk, len(mic) - pos)
         core.feed_mic(mic[pos:pos + step])
         tap.push_samples(ref[pos:pos + step])
         if pause:
             time.sleep(pause)
-        ev = core.process_available()
+        event = _drain(core)
         pos += step
-        if ev == "bargein":
+        if event == "bargein":
             return "bargein"
-        if ev is not None and event is None:
-            event = ev
-    return event
+    return None
 
 
 def _new_core(vad):
@@ -106,8 +122,9 @@ class BargeInArmCoordinateTest(unittest.TestCase):
         """标定前积压 4s 时，积压后部的首句必须打断，不能按最新喂入点预热掉。"""
         delay = 320
         total = 4 * SR
-        speech_at = int(2.6 * SR)
-        speech_n = int(0.45 * SR)
+        # 落在「保留的 1.5s 尾部」里、预热之后，并且在标定尾窗之前。
+        speech_at = 45000
+        speech_n = 4608
         self.assertLessEqual(speech_at + speech_n, total - CALIB_MIN_SAMPLES)
 
         ref = _noise(total, 0.10, 1)
@@ -122,12 +139,11 @@ class BargeInArmCoordinateTest(unittest.TestCase):
             event = _feed(core, tap, mic, ref, chunk=1024)
         self.assertEqual("bargein", event)
         self.assertIsNotNone(core._arm_until)
-        self.assertLess(core._arm_until, speech_at)
-        self.assertGreater(core._seg_end, core._arm_until)
+        self.assertGreaterEqual(core._seg_end, core._arm_until)
         self.assertGreater(core._mic_proc, speech_at)
-        self.assertLess(core._mic_proc, speech_at + speech_n + SR // 2)
-        # 旧锚点是 tail_end + ARM（接近最新喂入 + 0.35s），会盖住这段语音。
-        self.assertLess(core._arm_until, core._mic_fed - ARM_SAMPLES)
+        # 决策时不能还背着整段 4s。比预滚更老的样本应已被丢掉。
+        self.assertLessEqual(len(core._mic_pending), LIVE_PENDING_CAP + PROCESS_BUDGET_SAMPLES)
+        self.assertLessEqual(core._mic_fed - core._mic_proc, LIVE_PENDING_CAP + PROCESS_BUDGET_SAMPLES)
 
         preroll = np.frombuffer(core.preroll_bytes, dtype=np.int16)
         self.assertGreater(len(preroll), SR // 2)
@@ -196,31 +212,29 @@ class BargeInArmCoordinateTest(unittest.TestCase):
     def test_fast_and_slow_processing_share_sample_decision(self):
         """同一段样本，一次喂完和慢速分块（含墙钟等待）都要打断，预热点不跟墙钟走。"""
         delay = 256
-        total = 2 * SR
-        # 落在预热之后、标定尾窗之前，快路径和慢路径看到的都是同一句。
-        speech_at = int(0.90 * SR)
-        speech_n = 4608
-        ref = _noise(total, 0.10, 10)
-        mic = _delayed(ref, delay, 0.55)
-        mic = mic.copy()
-        mic[speech_at:speech_at + speech_n] += _noise(speech_n, 0.50, 11)
+        echo_n = SR
+        speech_n = int(0.40 * SR)
+        echo_ref = _noise(echo_n, 0.10, 10)
+        echo_mic = _delayed(echo_ref, delay, 0.55)
+        speech_ref = _noise(speech_n, 0.08, 11)
+        speech_mic = _delayed(speech_ref, min(delay, speech_n // 4), 0.2) + _noise(speech_n, 0.55, 12)
 
         def run(chunk: int, pause: float):
             tap, core = _new_core(_energy_vad())
             started = time.perf_counter()
-            event = _feed(core, tap, mic, ref, chunk=chunk, pause=pause)
+            self.assertIsNone(_feed(core, tap, echo_mic, echo_ref, chunk=chunk, pause=pause))
+            event = _feed(core, tap, speech_mic, speech_ref, chunk=chunk, pause=0.0)
             return event, core._arm_until, time.perf_counter() - started
 
-        fast_event, fast_arm, fast_dt = run(total, 0.0)
-        slow_event, slow_arm, slow_dt = run(1024, 0.008)
+        fast_event, fast_arm, fast_dt = run(echo_n, 0.0)
+        slow_event, slow_arm, slow_dt = run(640, 0.002)
         self.assertEqual("bargein", fast_event)
         self.assertEqual("bargein", slow_event)
         self.assertIsNotNone(fast_arm)
         self.assertIsNotNone(slow_arm)
         self.assertLess(abs(fast_arm - slow_arm), AEC_BLOCK_LEN * 2)
-        self.assertLess(fast_arm, speech_at)
-        self.assertLess(fast_dt, 0.20)
-        self.assertGreater(slow_dt, fast_dt + 0.10)
+        self.assertLess(fast_dt, 0.30)
+        self.assertGreater(slow_dt, fast_dt + 0.03)
 
     def test_pure_echo_does_not_trigger(self):
         """纯回声：能量门 VAD 不报，始终报语音的 VAD 也被电平门挡住。"""
@@ -256,7 +270,8 @@ class BargeInArmCoordinateTest(unittest.TestCase):
         tap, core = _new_core(_energy_vad(-12.0))
         self.assertIsNone(_feed(core, tap, mic, ref, chunk=2048))
         self.assertIsNotNone(core._arm_until)
-        self.assertGreater(core._arm_until, silence)
+        self.assertEqual(0, core._arm_voiced)
+        self.assertFalse(core.triggered)
 
     def test_long_delay_calibration_and_reset(self):
         """大于旧版 0.5s 搜索上限的管线时延仍能对齐；start() 清空本期状态。"""
@@ -296,8 +311,8 @@ class BargeInArmCoordinateTest(unittest.TestCase):
         t = np.arange(bad_n, dtype=np.float32) / SR
         ref_bad = (0.15 * np.sin(2 * np.pi * 180 * t)).astype(np.float32)
         mic_bad = (0.12 * np.sin(2 * np.pi * 470 * t)).astype(np.float32)
-        speech_at = int(2.5 * SR)
-        speech_n = int(0.45 * SR)
+        speech_at = int(4.45 * SR)
+        speech_n = int(0.40 * SR)
         mic_bad = mic_bad.copy()
         mic_bad[speech_at:speech_at + speech_n] += _noise(speech_n, 0.55, 16)
         event = _feed(core, tap, mic_bad, ref_bad, chunk=2048)
@@ -364,6 +379,74 @@ class BargeInArmCoordinateTest(unittest.TestCase):
         self.assertGreater(len(preroll), 0)
         self.assertLessEqual(len(preroll), PREROLL_SAMPLES)
 
+    def test_one_call_does_not_drain_multi_second_backlog(self):
+        """16k 分块喂入后，单次处理不得超过预算。当前补丁会一次啃完整段。"""
+        delay = 256
+        total = 3 * SR
+        ref = _noise(total, 0.12, 41)
+        mic = _delayed(ref, delay, 0.55)
+        tap, core = _new_core(_energy_vad())
+        # 先攒满再标定，模拟监视线程被上一轮堵住之后一次性读到数秒。
+        core.feed_mic(mic)
+        tap.push_samples(ref)
+        proc_before = core._mic_proc
+        core.process_available()
+        advanced = core._mic_proc - proc_before
+        self.assertLessEqual(advanced, LIVE_PENDING_CAP + PROCESS_BUDGET_SAMPLES)
+        self.assertLessEqual(len(core._mic_pending), LIVE_PENDING_CAP)
+        self.assertGreater(len(core._mic_pending), 0)
+
+    def test_slow_aec_yields_so_playback_can_tick(self):
+        """慢 AEC 时单次调用必须返回，播放节拍不能等整段积压结束。"""
+        delay = 200
+        total = 2 * SR
+        ref = _noise(total, 0.12, 42)
+        mic = _delayed(ref, delay, 0.5)
+        tap, core = _new_core(_energy_vad())
+        core.feed_mic(mic)
+        tap.push_samples(ref)
+        real = core._aec.process
+
+        def slow(mic_blk, ref_blk):
+            time.sleep(0.004)
+            return real(mic_blk, ref_blk)
+
+        core._aec.process = slow
+        ticks = []
+        for _ in range(6):
+            started = time.perf_counter()
+            core.process_available()
+            ticks.append(time.perf_counter() - started)
+            # 调用返回后主循环才能接着写播放；这里用间隔代表一次播放节拍。
+        self.assertGreater(len(core._mic_pending), SR // 2)
+        self.assertTrue(all(dt < 0.05 for dt in ticks))
+        full_drain_blocks = total / AEC_BLOCK_LEN
+        self.assertLess(sum(ticks), full_drain_blocks * 0.004 * 0.5)
+
+    def test_diverged_aec_output_does_not_count_as_speech(self):
+        """峰值远超满幅是滤波器发散，不能当成打断。"""
+        delay = 200
+        n = 2 * SR
+        ref = _noise(n, 0.12, 44)
+        mic = _delayed(ref, delay, 0.5)
+        tap, core = _new_core(_always_speech)
+        core.feed_mic(mic[: SR])
+        tap.push_samples(ref[: SR])
+        _drain(core)
+        self.assertTrue(core.calibrated)
+
+        def explode(mic_blk, ref_blk):
+            return np.full(len(mic_blk), AEC_DIVERGE_PEAK * 2, dtype=np.float32)
+
+        core._aec.process = explode
+        core.feed_mic(mic[SR // 2:])
+        tap.push_samples(ref[SR // 2:])
+        with self.assertLogs("xiaozhi", level="WARNING") as logs:
+            event = _drain(core)
+        self.assertIsNone(event)
+        self.assertFalse(core.triggered)
+        self.assertIn("diverged", "\n".join(logs.output))
+
 
 class AbortMessageRegressionTest(unittest.TestCase):
     def test_protocol_abort_type_is_abort(self):
@@ -401,15 +484,22 @@ class AbortMessageRegressionTest(unittest.TestCase):
         start = text.index("async def _relisten_after_bargein")
         end = text.index("async def _play_notify")
         body = text[start:end]
-        self.assertIn("send_abort_speaking(AbortReason.ABORT)", body)
-        self.assertNotIn("WAKE_WORD_DETECTED", body)
-        self.assertNotIn("send_abort_speaking(AbortReason.wake_word_detected)", body)
+        stop_fn = text[text.index("async def _abort_and_stop_speaker"):text.index("async def start_wakeup_session")]
+        self.assertIn("_abort_and_stop_speaker", body)
+        self.assertIn("send_abort_speaking(AbortReason.ABORT)", stop_fn)
+        self.assertIn("stop_device_audio", stop_fn)
+        self.assertIn("stop_playing", stop_fn)
+        self.assertLess(
+            stop_fn.index("send_abort_speaking(AbortReason.ABORT)"),
+            stop_fn.index("await speaker.stop_device_audio()"),
+        )
+        self.assertNotIn("WAKE_WORD_DETECTED", body + stop_fn)
         self.assertNotIn("run_coroutine_threadsafe", body)
         self.assertEqual(2, body.count("_await_on_app_loop"))
-        abort_at = body.index("send_abort_speaking(AbortReason.ABORT)")
+        self.assertLess(body.index("output_stream.stop_stream"), body.index("_abort_and_stop_speaker"))
         preroll_at = body.index("set_speech_frames(preroll)")
         listen_at = body.index("send_start_listening(ListeningMode.MANUAL)")
-        self.assertLess(abort_at, preroll_at)
+        self.assertLess(body.index("_abort_and_stop_speaker"), preroll_at)
         self.assertLess(preroll_at, listen_at)
         self.assertLess(
             body.index("Barge-in abort sent"),
@@ -419,6 +509,42 @@ class AbortMessageRegressionTest(unittest.TestCase):
             body.index("Barge-in preroll queued"),
             body.index("Barge-in listen sent"),
         )
+
+    def test_duplicate_tts_stop_does_not_raise(self):
+        """两份 set_result(True) 入队时，后一份必须看到已完成，而不是抛 InvalidStateError。"""
+        loop = asyncio.new_event_loop()
+        errors = []
+
+        def _finish(fut):
+            if not fut.done():
+                fut.set_result(True)
+
+        async def scenario():
+            fut = loop.create_future()
+            loop.call_soon(_finish, fut)
+            loop.call_soon(_finish, fut)
+            loop.call_soon(lambda: errors.append("scheduled-ok"))
+            result = await fut
+            await asyncio.sleep(0)
+            return result
+
+        try:
+            loop.set_exception_handler(lambda _loop, ctx: errors.append(ctx.get("message", "")))
+            result = loop.run_until_complete(scenario())
+        finally:
+            loop.close()
+        self.assertTrue(result)
+        self.assertNotIn("invalid state", " ".join(errors).lower())
+        self.assertTrue(any("scheduled-ok" == item for item in errors))
+        stop = text_of_stop_handler()
+        self.assertIn("if not fut.done()", stop)
+        self.assertNotIn(".set_result, True", stop)
+        self.assertIn("fut.set_result(True)", stop)
+
+
+def text_of_stop_handler() -> str:
+    text = (ROOT / "core" / "xiaozhi.py").read_text(encoding="utf-8")
+    return text[text.index("def _handle_tts_stop"):text.index("def _handle_stt_message")]
 
 
 if __name__ == "__main__":

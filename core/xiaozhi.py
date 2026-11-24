@@ -312,11 +312,22 @@ class XiaoZhi:
             self.set_device_state(DeviceState.SPEAKING)
 
     def _handle_tts_stop(self):
-        """Handle TTS stop."""
-        if self._tts_stop_future and not self._tts_stop_future.done() and self._session_loop:
-            self._session_loop.call_soon_threadsafe(
-                self._tts_stop_future.set_result, True
-            )
+        """Handle TTS stop.
+
+        完成回调必须在 session loop 上再次检查 done()。stop 可能来两份
+        （一句结束、abort 再来一次），两份都在入队前看到 future 未完成，
+        后一份 set_result(True) 会在回调里抛 InvalidStateError。
+        """
+        future = self._tts_stop_future
+        loop = self._session_loop
+        if future is None or loop is None:
+            return
+
+        def _finish(fut=future):
+            if not fut.done():
+                fut.set_result(True)
+
+        loop.call_soon_threadsafe(_finish)
 
     def _handle_stt_message(self, data):
         """Handle STT message."""
@@ -432,6 +443,20 @@ class XiaoZhi:
         """Send abort speaking command."""
         if self.protocol:
             await self.protocol.send_abort_speaking(reason)
+
+    async def _abort_and_stop_speaker(self):
+        """在主事件循环上发 abort，并停掉设备上已经缓冲的播放。
+
+        只发 websocket abort 不会杀掉 aplay / miplayer 里已经排队的音频，
+        音箱会把缓冲播完。停播走 SpeakerManager.stop_device_audio，
+        与唤醒打断同一条本地通道，不另开一条 websocket 发送。
+        """
+        await self.send_abort_speaking(AbortReason.ABORT)
+        speaker = get_speaker()
+        if speaker is not None:
+            await speaker.stop_device_audio()
+            return
+        await open_xiaoai_server.stop_playing()
 
     # Wakeup session
 
@@ -673,9 +698,17 @@ class XiaoZhi:
             f"preroll_bytes={len(preroll)}",
             module="XiaoZhi",
         )
-        await self._await_on_app_loop(
-            self.send_abort_speaking(AbortReason.ABORT)
-        )
+        codec = get_audio_codec()
+        if codec is not None and getattr(codec, "output_stream", None) is not None:
+            try:
+                if codec.output_stream.is_active():
+                    codec.output_stream.stop_stream()
+            except Exception as exc:
+                logger.warning(
+                    f"[XiaoZhi] Barge-in output stop failed: {type(exc).__name__}",
+                    module="XiaoZhi",
+                )
+        await self._await_on_app_loop(self._abort_and_stop_speaker())
         logger.info(
             "[XiaoZhi] Barge-in abort sent: "
             f"type={AbortReason.ABORT} dt_ms={(time.monotonic() - t0) * 1000:.0f}",
