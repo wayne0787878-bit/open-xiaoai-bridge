@@ -14,12 +14,15 @@ The main application flow is managed by app.py.
 import asyncio
 import json
 import os
+import re
 import threading
+import time
 
 import open_xiaoai_server
 
 from core.ref import get_audio_codec, get_speaker, get_vad, set_speech_frames
 from core.services.protocols.protocol import Protocol
+from core.services.protocols.websocket_protocol import WebsocketProtocol
 from core.services.protocols.typing import (
     AbortReason,
     DeviceState,
@@ -47,6 +50,337 @@ def _load_notify_sound() -> bytes | None:
 
 
 _NOTIFY_PCM = _load_notify_sound()
+
+# 打断监视器灰度开关（环境变量 XIAOZHI_BARGEIN）：
+#   未设/0/off → off（不装配监视器，行为与现行版一致）
+#   observe/log → observe（监视器运行并记录判定，不真打断）
+#   1/true/yes/on → on（命中后发 {"type":"abort"} 并续听；服务端忽略 wake_word_detected）
+_BARGEIN_ENV = os.environ.get("XIAOZHI_BARGEIN", "").strip().lower()
+if _BARGEIN_ENV in ("1", "true", "yes", "on"):
+    BARGEIN_MODE = "on"
+elif _BARGEIN_ENV in ("observe", "log"):
+    BARGEIN_MODE = "observe"
+else:
+    BARGEIN_MODE = "off"
+
+
+_SAFE_FAILURE_KEYS = {
+    "phase": re.compile(r"[a-z_]{1,32}"),
+    "exc": re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,64}"),
+    "http": re.compile(r"\d{3}"),
+    "close": re.compile(r"\d{1,5}"),
+    "errno": re.compile(r"-?\d{1,6}"),
+    "elapsed_ms": re.compile(r"\d{1,8}"),
+}
+
+
+def safe_ws_failure(phase: str, exc: BaseException | None = None, elapsed_ms: int | None = None) -> str:
+    """连接失败的白名单摘要。不含异常原文、地址、query 或 header。"""
+    parts = [f"phase={phase if _SAFE_FAILURE_KEYS['phase'].fullmatch(phase or '') else 'unknown'}"]
+    if isinstance(elapsed_ms, int) and elapsed_ms >= 0:
+        parts.append(f"elapsed_ms={elapsed_ms}")
+    if exc is not None:
+        name = type(exc).__name__
+        if _SAFE_FAILURE_KEYS["exc"].fullmatch(name):
+            parts.append(f"exc={name}")
+        status = getattr(exc, "status_code", None)
+        response = getattr(exc, "response", None)
+        if not isinstance(status, int) and response is not None:
+            status = getattr(response, "status_code", None)
+        if isinstance(status, int) and 100 <= status <= 599:
+            parts.append(f"http={status}")
+        close = getattr(exc, "code", None)
+        for frame_name in ("rcvd", "sent"):
+            if isinstance(close, int):
+                break
+            frame = getattr(exc, frame_name, None)
+            if frame is not None:
+                close = getattr(frame, "code", None)
+        if isinstance(close, int) and 0 <= close <= 4999:
+            parts.append(f"close={close}")
+        err_no = getattr(exc, "errno", None)
+        if isinstance(err_no, int):
+            parts.append(f"errno={err_no}")
+    return " ".join(parts)
+
+
+def redact_failure_text(message: object) -> str:
+    """只保留已知安全字段。无法识别时不回显原文。"""
+    if not isinstance(message, str):
+        return "phase=unspecified"
+    kept = []
+    for token in message.split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        rule = _SAFE_FAILURE_KEYS.get(key)
+        if rule is not None and rule.fullmatch(value):
+            kept.append(f"{key}={value}")
+    return " ".join(kept) if kept else "phase=unspecified"
+
+
+class GuardedWebsocketProtocol(WebsocketProtocol):
+    """镜像内协议类的子类，定义在已挂载的 xiaozhi.py 中。
+
+    容器只替换这一个文件。不改 websocket_protocol.py，不写磁盘，
+    也不从网络加载代码。hello、header 和 abort 的发送仍走基类 send_text。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._reconnect_task = None
+        self._reconnect_attempts = 0
+        self._reconnect_stop = False
+        self._in_reconnect_loop = False
+        self._suppress_reader_reconnect = False
+        self._connect_lock = None
+        self._lock_init = threading.Lock()
+        self._last_failure = "phase=unspecified"
+        self._hello_timeout = 10.0
+        self._retry_base_s = None
+
+    def _get_connect_lock(self):
+        with self._lock_init:
+            if self._connect_lock is None:
+                self._connect_lock = asyncio.Lock()
+            return self._connect_lock
+
+    async def connect(self) -> bool:
+        async with self._get_connect_lock():
+            return await self._connect_locked()
+
+    async def _connect_locked(self) -> bool:
+        started = time.perf_counter()
+        try:
+            await self._close_websocket()
+            self.WEBSOCKET_URL = self.config.get_config("NETWORK.WEBSOCKET_URL")
+            self.WEBSOCKET_ACCESS_TOKEN = self.config.get_config(
+                "NETWORK.WEBSOCKET_ACCESS_TOKEN"
+            )
+            self.CLIENT_ID = self.config.get_client_id()
+            self.DEVICE_ID = self.config.get_device_id()
+            self.hello_received = asyncio.Event()
+            headers = {
+                "Authorization": f"Bearer {self.WEBSOCKET_ACCESS_TOKEN}",
+                "Protocol-Version": "1",
+                "Device-Id": self.DEVICE_ID,
+                "Client-Id": self.CLIENT_ID,
+            }
+            import websockets
+
+            self.websocket = await websockets.connect(
+                uri=self.WEBSOCKET_URL, additional_headers=headers
+            )
+            await self._cancel_handler()
+            self._handler_task = asyncio.create_task(self._message_handler())
+            hello_message = {
+                "type": "hello",
+                "version": 1,
+                "transport": "websocket",
+                "audio_params": {
+                    "format": "opus",
+                    "sample_rate": 16000,
+                    "channels": 1,
+                    "frame_duration": 60,
+                },
+            }
+            await self.send_text(json.dumps(hello_message))
+            try:
+                await asyncio.wait_for(
+                    self.hello_received.wait(), timeout=self._hello_timeout
+                )
+            except asyncio.TimeoutError:
+                return await self._fail_connect("hello_timeout", None, started)
+            self.connected = True
+            self._last_failure = "phase=ok"
+            logger.info(
+                "[xiaozhi-esp32-server] 连接成功",
+                module="xiaozhi-esp32-server",
+            )
+            return True
+        except Exception as exc:
+            return await self._fail_connect("connect", exc, started)
+
+    async def _fail_connect(self, phase: str, exc: BaseException | None, started: float) -> bool:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        summary = safe_ws_failure(phase, exc, elapsed_ms)
+        self._last_failure = summary
+        logger.warning(
+            f"[xiaozhi-esp32-server] connect failed {summary}",
+            module="xiaozhi-esp32-server",
+        )
+        await self._cancel_handler()
+        await self._close_websocket()
+        if self.on_network_error and not self._in_reconnect_loop:
+            self.on_network_error(summary)
+        return False
+
+    async def _close_websocket(self):
+        websocket = self.websocket
+        self.websocket = None
+        self.connected = False
+        if not websocket:
+            return
+        try:
+            await websocket.close()
+        except Exception as exc:
+            logger.warning(
+                "[xiaozhi-esp32-server] close failed "
+                f"{safe_ws_failure('close', exc)}",
+                module="xiaozhi-esp32-server",
+            )
+
+    async def _cancel_handler(self):
+        task = self._handler_task
+        self._handler_task = None
+        if task is None or task.done():
+            return
+        self._suppress_reader_reconnect = True
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning(
+                "[xiaozhi-esp32-server] reader cancel failed "
+                f"{safe_ws_failure('reader_cancel', exc)}",
+                module="xiaozhi-esp32-server",
+            )
+        finally:
+            self._suppress_reader_reconnect = False
+
+    async def _message_handler(self):
+        try:
+            async for message in self.websocket:
+                if isinstance(message, str):
+                    try:
+                        data = json.loads(message)
+                        session_id = data.get("session_id")
+                        if session_id and session_id != self.session_id:
+                            self.session_id = session_id
+                            logger.info(
+                                "[xiaozhi-esp32-server] Updated session_id: "
+                                f"{session_id}",
+                                module="xiaozhi-esp32-server",
+                            )
+                        msg_type = data.get("type")
+                        if msg_type == "hello":
+                            await self._handle_server_hello(data)
+                        elif self.on_incoming_json:
+                            self.on_incoming_json(data)
+                    except json.JSONDecodeError:
+                        pass
+                elif self.on_incoming_audio:
+                    self.on_incoming_audio(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._suppress_reader_reconnect:
+                return
+            summary = safe_ws_failure("reader", exc)
+            self._last_failure = summary
+            logger.warning(
+                f"[xiaozhi-esp32-server] reader stopped {summary}",
+                module="xiaozhi-esp32-server",
+            )
+            self.connected = False
+            if self.on_audio_channel_closed:
+                await self._invoke_callback(self.on_audio_channel_closed)
+            if not self._reconnect_stop:
+                self.ensure_reconnect()
+
+    async def send_audio(self, frames: list[bytes]):
+        if not self.is_audio_channel_opened():
+            return
+        try:
+            for frame in frames:
+                await self.websocket.send(frame)
+        except Exception as exc:
+            logger.error(
+                "[xiaozhi-esp32-server] audio send failed "
+                f"{safe_ws_failure('send_audio', exc)}",
+                module="xiaozhi-esp32-server",
+            )
+
+    async def _handle_server_hello(self, data: dict):
+        try:
+            transport = data.get("transport")
+            if not transport or transport != "websocket":
+                return
+            self.hello_received.set()
+            if self.on_audio_channel_opened:
+                await self._invoke_callback(self.on_audio_channel_opened)
+        except Exception as exc:
+            summary = safe_ws_failure("hello_parse", exc)
+            self._last_failure = summary
+            logger.warning(
+                f"[xiaozhi-esp32-server] hello failed {summary}",
+                module="xiaozhi-esp32-server",
+            )
+            if self.on_network_error and not self._in_reconnect_loop:
+                self.on_network_error(summary)
+
+    def _next_retry_delay(self) -> float:
+        if self._retry_base_s is not None:
+            return float(self._retry_base_s)
+        return float(min(5 * (2 ** (self._reconnect_attempts - 1)), 60))
+
+    def ensure_reconnect(self):
+        """最多一个重连任务。已经连上或正在关闭时不再创建。"""
+        if self._reconnect_stop or self.connected:
+            return
+        task = self._reconnect_task
+        if task is not None and not task.done():
+            return
+        self._reconnect_task = asyncio.get_running_loop().create_task(
+            self._reconnect_loop()
+        )
+
+    async def _reconnect_loop(self):
+        self._in_reconnect_loop = True
+        try:
+            while not self._reconnect_stop:
+                self._reconnect_attempts += 1
+                delay = self._next_retry_delay()
+                logger.info(
+                    "[xiaozhi-esp32-server] channel closed "
+                    f"retry_in_s={delay:.0f} attempt={self._reconnect_attempts} "
+                    f"{self._last_failure}",
+                    module="xiaozhi-esp32-server",
+                )
+                await asyncio.sleep(delay)
+                if self._reconnect_stop:
+                    return
+                if await self.connect():
+                    self._reconnect_attempts = 0
+                    return
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._in_reconnect_loop = False
+            current = asyncio.current_task()
+            if self._reconnect_task is current:
+                self._reconnect_task = None
+
+    async def close_audio_channel(self):
+        """关闭通道并取消重连。关闭本身不再睡眠后 connect。"""
+        self._reconnect_stop = True
+        task = self._reconnect_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self._cancel_handler()
+        await self._close_websocket()
+        if self.on_audio_channel_closed:
+            await self._invoke_callback(self.on_audio_channel_closed)
+
+    async def open_audio_channel(self):
+        """不启动镜像里的心跳循环。心跳失败会在心跳任务里再调用 connect。"""
+        await self.connect()
 
 
 class XiaoZhi:
@@ -81,6 +415,15 @@ class XiaoZhi:
         self._vad_future: asyncio.Future | None = None
         self._tts_stop_future: asyncio.Future | None = None
         self._is_first_round = False
+
+        # Barge-in monitor state（灰度开关关闭时保持 None/False，不装配）
+        self._bargein_monitor = None
+        self._bargein_future: asyncio.Future | None = None
+        self._in_wakeup_session = False
+        logger.info(
+            f"[XiaoZhi] Barge-in monitor mode: {BARGEIN_MODE} "
+            f"(XIAOZHI_BARGEIN={os.environ.get('XIAOZHI_BARGEIN') or 'not set'})"
+        )
 
     def set_app(self, app):
         """Set reference to main app."""
@@ -122,13 +465,23 @@ class XiaoZhi:
                 if not self._audio_codec.output_stream.is_active():
                     self._audio_codec.output_stream.start_stream()
 
+        # 打断监视器（灰度）：仅在 SPEAKING 期运行，其余状态停。
+        # 监视流与主 input_stream 独立，不受上面的流管理影响。
+        monitor = getattr(self, "_bargein_monitor", None)
+        if monitor is not None:
+            try:
+                if state == DeviceState.SPEAKING:
+                    monitor.start()
+                else:
+                    monitor.stop()
+            except Exception:
+                pass
+
     # Connection management
 
     async def connect(self):
         """Connect to XiaoZhi server."""
-        from core.services.protocols.websocket_protocol import WebsocketProtocol
-
-        self.protocol = WebsocketProtocol()
+        self.protocol = GuardedWebsocketProtocol()
 
         # Wire up callbacks directly
         self.protocol.on_network_error = self._on_network_error
@@ -160,18 +513,74 @@ class XiaoZhi:
             logger.warning(f"[XiaoZhi] Failed to initialize audio: {e}")
             return
 
+        # 打断监视器装配（灰度开关非 off 时）；装配失败只禁用监视器，
+        # 不影响主流程。
+        if BARGEIN_MODE != "off":
+            try:
+                from core.services.audio.bargein import BargeInMonitor
+
+                monitor = BargeInMonitor(
+                    on_trigger=self._on_bargein_detected,
+                    observe=(BARGEIN_MODE == "observe"),
+                )
+                stream = self._audio_codec.create_monitor_stream()
+                if stream is not None:
+                    monitor.attach_stream(stream)
+                    self._audio_codec.set_reference_sink(monitor.feed_reference_pcm)
+                    self._bargein_monitor = monitor
+                    logger.info(
+                        f"[XiaoZhi] Barge-in monitor ready (mode={BARGEIN_MODE})"
+                    )
+                else:
+                    logger.warning(
+                        "[XiaoZhi] Barge-in monitor stream unavailable, monitor disabled"
+                    )
+            except Exception as e:
+                logger.warning(f"[XiaoZhi] Failed to set up barge-in monitor: {e}")
+                self._bargein_monitor = None
+
         threading.Thread(target=self._audio_input_trigger, daemon=True).start()
+
+    def _on_bargein_detected(self, preroll: bytes):
+        """打断监视器命中回调（监视器线程调用）。
+
+        仅在唤醒会话正等待 TTS 结束时才兑现：把消回声预缓冲经
+        session loop 交给 _wait_tts_stop_or_bargein。其余时机
+        （无会话/未在等待）忽略，不改变任何现有行为。
+        """
+        future = self._bargein_future
+        accepted = (
+            self._in_wakeup_session
+            and self._session_loop is not None
+            and future is not None
+            and not future.done()
+        )
+        logger.info(
+            "[XiaoZhi] Barge-in trigger: "
+            f"preroll_bytes={len(preroll)} accepted={accepted} "
+            f"in_session={self._in_wakeup_session}",
+            module="XiaoZhi",
+        )
+        if accepted:
+            self._session_loop.call_soon_threadsafe(future.set_result, preroll)
 
     # Protocol callbacks
 
     def _on_network_error(self, message):
-        """Handle network error."""
+        """记录安全摘要，并只启动一个重连任务。
+
+        旧实现先写成 IDLE 再判断不是 CONNECTING，判断恒为真，
+        然后 schedule(disconnect)。disconnect 又会重连，重复回调
+        会叠出多条循环。这里不再排 disconnect。
+        """
+        logger.warning(
+            f"[XiaoZhi] network error {redact_failure_text(message)}",
+            module="XiaoZhi",
+        )
         self.set_device_state(DeviceState.IDLE)
-        if self.device_state != DeviceState.CONNECTING:
-            self.set_device_state(DeviceState.IDLE)
-            asyncio.run_coroutine_threadsafe(
-                self.disconnect(), self._app.loop
-            )
+        protocol = self.protocol
+        if protocol is not None and hasattr(protocol, "ensure_reconnect"):
+            protocol.ensure_reconnect()
 
     def _on_incoming_audio(self, data):
         """Handle incoming audio."""
@@ -229,11 +638,22 @@ class XiaoZhi:
             self.set_device_state(DeviceState.SPEAKING)
 
     def _handle_tts_stop(self):
-        """Handle TTS stop."""
-        if self._tts_stop_future and not self._tts_stop_future.done() and self._session_loop:
-            self._session_loop.call_soon_threadsafe(
-                self._tts_stop_future.set_result, True
-            )
+        """Handle TTS stop.
+
+        完成回调必须在 session loop 上再次检查 done()。stop 可能来两份
+        （一句结束、abort 再来一次），两份都在入队前看到 future 未完成，
+        后一份 set_result(True) 会在回调里抛 InvalidStateError。
+        """
+        future = self._tts_stop_future
+        loop = self._session_loop
+        if future is None or loop is None:
+            return
+
+        def _finish(fut=future):
+            if not fut.done():
+                fut.set_result(True)
+
+        loop.call_soon_threadsafe(_finish)
 
     def _handle_stt_message(self, data):
         """Handle STT message."""
@@ -350,6 +770,39 @@ class XiaoZhi:
         if self.protocol:
             await self.protocol.send_abort_speaking(reason)
 
+    async def _abort_and_stop_speaker(self):
+        """在主事件循环上发 abort，并停掉设备上已经缓冲的播放。
+
+        只发 websocket abort 不会杀掉 aplay / miplayer 里已经排队的音频，
+        音箱会把缓冲播完。停播走 SpeakerManager.stop_device_audio，
+        与唤醒打断同一条本地通道，不另开一条 websocket 发送。
+        """
+        t0 = time.perf_counter()
+        await self.send_abort_speaking(AbortReason.ABORT)
+        abort_ms = (time.perf_counter() - t0) * 1000.0
+        speaker = get_speaker()
+        shell_ms = -1.0
+        stop_play_ms = -1.0
+        if speaker is not None:
+            t1 = time.perf_counter()
+            await speaker.run_shell(
+                "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
+            )
+            shell_ms = (time.perf_counter() - t1) * 1000.0
+            t2 = time.perf_counter()
+            await open_xiaoai_server.stop_playing()
+            stop_play_ms = (time.perf_counter() - t2) * 1000.0
+        else:
+            t2 = time.perf_counter()
+            await open_xiaoai_server.stop_playing()
+            stop_play_ms = (time.perf_counter() - t2) * 1000.0
+        logger.info(
+            "[Diag] stop "
+            f"abort_ms={abort_ms:.1f} shell_ms={shell_ms:.1f} "
+            f"stop_play_ms={stop_play_ms:.1f}",
+            module="XiaoZhi",
+        )
+
     # Wakeup session
 
     def stop_wakeup_session(self):
@@ -358,6 +811,8 @@ class XiaoZhi:
             self._session_loop.call_soon_threadsafe(self._vad_future.cancel)
         if self._session_loop and self._tts_stop_future and not self._tts_stop_future.done():
             self._session_loop.call_soon_threadsafe(self._tts_stop_future.cancel)
+        if self._session_loop and self._bargein_future and not self._bargein_future.done():
+            self._session_loop.call_soon_threadsafe(self._bargein_future.cancel)
 
         self.set_device_state(DeviceState.IDLE)
 
@@ -380,6 +835,7 @@ class XiaoZhi:
         vad = get_vad()
         codec = get_audio_codec()
         speaker = get_speaker()
+        self._in_wakeup_session = True
 
         try:
             while True:
@@ -419,33 +875,46 @@ class XiaoZhi:
                 await self.send_start_listening(ListeningMode.MANUAL)
                 self.set_device_state(DeviceState.LISTENING)
 
-                # Wait for silence
-                vad.resume("silence")
-                result = await self._wait_vad_event()
-                if result:
-                    event_type, _ = result
-                    logger.debug(f"VAD detected silence, stop listening", module="XiaoZhi")
+                # 对话轮次：等待静音 → 停止监听 → 等待 TTS 结束。
+                # 播报期间若被真人打断（barge-in，灰度开启时），
+                # _wait_tts_stop_or_bargein 内部已完成 abort + 续听，
+                # 本轮直接回到等待静音，不退出会话；barge-in 关闭时
+                # 该等待与原 _wait_tts_stop 行为一致，内层只走一遍。
+                tts_finished = False
+                while True:
+                    # Wait for silence
+                    vad.resume("silence")
+                    result = await self._wait_vad_event()
+                    if result:
+                        event_type, _ = result
+                        logger.debug(f"VAD detected silence, stop listening", module="XiaoZhi")
 
-                # Prepare TTS stop future before sending stop_listening,
-                # so we don't miss the tts_stop event.
-                self._tts_stop_future = self._session_loop.create_future()
+                    # Prepare TTS stop future before sending stop_listening,
+                    # so we don't miss the tts_stop event.
+                    self._tts_stop_future = self._session_loop.create_future()
 
-                await self.send_stop_listening()
-                self.set_device_state(DeviceState.IDLE)
+                    await self.send_stop_listening()
+                    self.set_device_state(DeviceState.IDLE)
 
-                # Wait for TTS to finish, then start next round
-                tts_finished = await self._wait_tts_stop(timeout=30)
+                    # Wait for TTS to finish (or barge-in), then start next round
+                    outcome = await self._wait_tts_stop_or_bargein(timeout=30)
+                    if outcome == "bargein":
+                        continue
+                    tts_finished = outcome == "tts"
+                    break
                 if not tts_finished:
                     break
         except asyncio.CancelledError:
             logger.debug("Wakeup session cancelled", module="XiaoZhi")
             raise
         finally:
+            self._in_wakeup_session = False
             if vad:
                 vad.pause()
             self.set_device_state(DeviceState.IDLE)
             self._vad_future = None
             self._tts_stop_future = None
+            self._bargein_future = None
 
     async def _wait_vad_event(self, timeout=None):
         """Wait for a VAD event (speech/silence)."""
@@ -489,6 +958,136 @@ class XiaoZhi:
             return False
         finally:
             self._tts_stop_future = None
+
+    async def _wait_tts_stop_or_bargein(self, timeout=None):
+        """等待 TTS 结束或播报中打断，返回 "tts" / "timeout" / "bargein"。
+
+        barge-in 未装配（灰度关闭）时与 _wait_tts_stop 行为一致，
+        仅返回形式不同。返回 "bargein" 时已完成 abort + 续听
+        （见 _relisten_after_bargein），调用方直接回到等待静音。
+        """
+        if not self._tts_stop_future:
+            self._tts_stop_future = self._session_loop.create_future()
+        tts_future = self._tts_stop_future
+
+        if self._bargein_monitor is None:
+            try:
+                await asyncio.wait_for(tts_future, timeout=timeout)
+                return "tts"
+            except asyncio.TimeoutError:
+                return "timeout"
+            finally:
+                if self._tts_stop_future is tts_future:
+                    self._tts_stop_future = None
+
+        self._bargein_future = self._session_loop.create_future()
+        bargein_future = self._bargein_future
+        try:
+            done, _ = await asyncio.wait(
+                {tts_future, bargein_future},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if bargein_future in done and not bargein_future.cancelled():
+                await self._relisten_after_bargein(
+                    bargein_future.result(), tts_future
+                )
+                return "bargein"
+            if tts_future in done:
+                if tts_future.cancelled():
+                    # 与 _wait_tts_stop 的 wait_for 语义对齐：
+                    # 外部 stop 取消 future 时按会话取消处理
+                    raise asyncio.CancelledError()
+                return "tts"
+            return "timeout"
+        finally:
+            if self._tts_stop_future is tts_future:
+                self._tts_stop_future = None
+            if self._bargein_future is bargein_future:
+                self._bargein_future = None
+            if not bargein_future.done():
+                bargein_future.cancel()
+
+    async def _await_on_app_loop(self, coro):
+        """在 MainApp.loop 上执行协程并等待其完成。
+
+        websocket 连接归 MainApp.loop 所有（协议的音频发送都在该
+        loop 上）；从 session loop 直接 await 协议发送，会与 app
+        loop 的音频发送并发写同一条连接，帧可能损坏——2026-11-23
+        on 档实测：连续第二次打断后服务端以 1007（invalid frame
+        payload）关闭连接。本方法与既有用户动作路径（start/stop/
+        abort 均经 run_coroutine_threadsafe 投递 app loop）对齐。
+        """
+        loop = self._app.loop if self._app else None
+        if loop is None or not loop.is_running():
+            return await coro
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return await asyncio.wrap_future(future)
+
+    async def _relisten_after_bargein(self, preroll: bytes, tts_future):
+        """打断命中后的处理：中止播报 → 等 tts stop → 带预缓冲续听。
+
+        - abort 用 AbortReason.ABORT：协议层把 reason 直接写进消息
+          type 字段，本机小智服务端只认 {"type": "abort"}，收到
+          {"type": "wake_word_detected"} 只会记「未知类型」并忽略
+          （2026-11-23 17:08 服务端日志实测）——曾导致 tts stop 等待
+          烧满 3s 超时、relisten 完成时用户短句早已说完；
+        - 等待被中止 TTS 的 tts stop（短超时兜底），并消费掉它，
+          避免迟到的 stop 误触发下一轮等待；
+        - 消回声预缓冲经 set_speech_frames 作为新一轮开头送出，
+          与 VAD 唤醒时的语音缓冲走同一条通道。
+        """
+        t0 = time.monotonic()
+        logger.info(
+            "[XiaoZhi] Barge-in relisten begin: "
+            f"preroll_bytes={len(preroll)}",
+            module="XiaoZhi",
+        )
+        codec = get_audio_codec()
+        if codec is not None and getattr(codec, "output_stream", None) is not None:
+            try:
+                if codec.output_stream.is_active():
+                    codec.output_stream.stop_stream()
+            except Exception as exc:
+                logger.warning(
+                    f"[XiaoZhi] Barge-in output stop failed: {type(exc).__name__}",
+                    module="XiaoZhi",
+                )
+        await self._await_on_app_loop(self._abort_and_stop_speaker())
+        logger.info(
+            "[XiaoZhi] Barge-in abort sent: "
+            f"type={AbortReason.ABORT} dt_ms={(time.monotonic() - t0) * 1000:.0f}",
+            module="XiaoZhi",
+        )
+        if tts_future is not None and not tts_future.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(tts_future), timeout=3)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        logger.info(
+            "[XiaoZhi] Barge-in tts-stop wait done: "
+            f"dt_ms={(time.monotonic() - t0) * 1000:.0f}",
+            module="XiaoZhi",
+        )
+        if preroll:
+            set_speech_frames(preroll)
+            logger.info(
+                "[XiaoZhi] Barge-in preroll queued: "
+                f"bytes={len(preroll)} dt_ms={(time.monotonic() - t0) * 1000:.0f}",
+                module="XiaoZhi",
+            )
+        codec = get_audio_codec()
+        if codec:
+            codec.input_stream.start_stream()
+        await self._await_on_app_loop(
+            self.send_start_listening(ListeningMode.MANUAL)
+        )
+        self.set_device_state(DeviceState.LISTENING)
+        logger.info(
+            "[XiaoZhi] Barge-in listen sent: type=listen state=start "
+            f"mode=manual dt_ms={(time.monotonic() - t0) * 1000:.0f}",
+            module="XiaoZhi",
+        )
 
     async def _play_notify(self, speaker):
         """Play the listening-ready notification sound."""
