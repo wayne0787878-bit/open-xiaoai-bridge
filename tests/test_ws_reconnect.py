@@ -44,8 +44,14 @@ _config_mod = types.ModuleType("core.utils.config")
 _config_mod.ConfigManager = _ConfigManager
 sys.modules["core.utils.config"] = _config_mod
 
-from core.services.protocols.websocket_protocol import (  # noqa: E402
-    WebsocketProtocol,
+_native = types.ModuleType("open_xiaoai_server")
+_native.decode_audio = lambda *_args, **_kwargs: b""
+sys.modules["open_xiaoai_server"] = _native
+
+from core.services.protocols.websocket_protocol import WebsocketProtocol  # noqa: E402
+from core.xiaozhi import (  # noqa: E402
+    GuardedWebsocketProtocol,
+    XiaoZhi,
     redact_failure_text,
     safe_ws_failure,
 )
@@ -125,9 +131,9 @@ def _install(script: Script):
     websockets.connect = connect
 
 
-def _protocol(script: Script) -> WebsocketProtocol:
+def _protocol(script: Script) -> GuardedWebsocketProtocol:
     _install(script)
-    proto = WebsocketProtocol()
+    proto = GuardedWebsocketProtocol()
     proto._hello_timeout = 0.05
     proto._retry_base_s = 0.01
     return proto
@@ -264,6 +270,58 @@ class ReconnectStateTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(proto.connect(), proto.connect())
         self.assertEqual(1, script.max_active)
         self.assertTrue(proto.connected)
+        await proto.close_audio_channel()
+        pending = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ]
+        self.assertEqual([], pending)
+
+    async def test_mounted_xiaozhi_file_owns_reconnect(self):
+        script = Script()
+        script.fail_remaining = 1
+        _install(script)
+        client = XiaoZhi.__new__(XiaoZhi)
+        client._app = None
+        client._audio_codec = None
+        client.protocol = None
+        with self.assertLogs("xiaozhi", level="WARNING") as cm:
+            ok = await client.connect()
+        self.assertFalse(ok)
+        proto = client.protocol
+        self.assertIsInstance(proto, GuardedWebsocketProtocol)
+        self.assertIsInstance(proto, WebsocketProtocol)
+        self.assertEqual("xiaozhi.py", Path(type(proto).connect.__code__.co_filename).name)
+        self.assertEqual(
+            "websocket_protocol.py",
+            Path(WebsocketProtocol.close_audio_channel.__code__.co_filename).name,
+        )
+        stock_source = Path(WebsocketProtocol.close_audio_channel.__code__.co_filename).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("通道被关闭", stock_source)
+        self.assertNotIn("ensure_reconnect", stock_source)
+        text = _failure_logs(cm)
+        self.assertIn("http=401", text)
+        self.assertIn("exc=HandshakeError", text)
+        for secret in ("secret", "wss://", "Bearer", "token"):
+            self.assertNotIn(secret, text)
+        task = proto._reconnect_task
+        self.assertIsNotNone(task)
+        proto.ensure_reconnect()
+        self.assertIs(task, proto._reconnect_task)
+        await client.disconnect()
+        self.assertTrue(task.cancelled() or task.done())
+        calls = script.calls
+        await asyncio.sleep(0.05)
+        self.assertEqual(calls, script.calls)
+        pending = [
+            item
+            for item in asyncio.all_tasks()
+            if item is not asyncio.current_task() and not item.done()
+        ]
+        self.assertEqual([], pending)
 
 
 if __name__ == "__main__":

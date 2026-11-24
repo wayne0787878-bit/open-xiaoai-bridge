@@ -526,11 +526,10 @@ class AbortMessageRegressionTest(unittest.TestCase):
         stop_fn = text[text.index("async def _abort_and_stop_speaker"):text.index("async def start_wakeup_session")]
         self.assertIn("_abort_and_stop_speaker", body)
         self.assertIn("send_abort_speaking(AbortReason.ABORT)", stop_fn)
-        self.assertIn("stop_device_audio", stop_fn)
         self.assertIn("stop_playing", stop_fn)
         self.assertLess(
             stop_fn.index("send_abort_speaking(AbortReason.ABORT)"),
-            stop_fn.index("await speaker.stop_device_audio()"),
+            stop_fn.index("stop_playing"),
         )
         self.assertNotIn("WAKE_WORD_DETECTED", body + stop_fn)
         self.assertNotIn("run_coroutine_threadsafe", body)

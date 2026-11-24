@@ -1,8 +1,6 @@
 import asyncio
 import inspect
 import json
-import re
-import time
 
 import websockets
 
@@ -11,60 +9,6 @@ from core.services.protocols.protocol import Protocol
 from core.services.protocols.typing import DeviceState
 from core.utils.config import ConfigManager
 from core.utils.logger import logger
-
-_SAFE_FAILURE_KEYS = {
-    "phase": re.compile(r"[a-z_]{1,32}"),
-    "exc": re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,64}"),
-    "http": re.compile(r"\d{3}"),
-    "close": re.compile(r"\d{1,5}"),
-    "errno": re.compile(r"-?\d{1,6}"),
-    "elapsed_ms": re.compile(r"\d{1,8}"),
-}
-
-
-def safe_ws_failure(phase: str, exc: BaseException | None = None, elapsed_ms: int | None = None) -> str:
-    """白名单连接失败摘要。不包含异常文本、地址、query 或 header。"""
-    parts = [f"phase={phase if _SAFE_FAILURE_KEYS['phase'].fullmatch(phase or '') else 'unknown'}"]
-    if isinstance(elapsed_ms, int) and elapsed_ms >= 0:
-        parts.append(f"elapsed_ms={elapsed_ms}")
-    if exc is not None:
-        name = type(exc).__name__
-        if _SAFE_FAILURE_KEYS["exc"].fullmatch(name):
-            parts.append(f"exc={name}")
-        status = getattr(exc, "status_code", None)
-        response = getattr(exc, "response", None)
-        if not isinstance(status, int) and response is not None:
-            status = getattr(response, "status_code", None)
-        if isinstance(status, int) and 100 <= status <= 599:
-            parts.append(f"http={status}")
-        close = getattr(exc, "code", None)
-        for frame_name in ("rcvd", "sent"):
-            if isinstance(close, int):
-                break
-            frame = getattr(exc, frame_name, None)
-            if frame is not None:
-                close = getattr(frame, "code", None)
-        if isinstance(close, int) and 0 <= close <= 4999:
-            parts.append(f"close={close}")
-        err_no = getattr(exc, "errno", None)
-        if isinstance(err_no, int):
-            parts.append(f"errno={err_no}")
-    return " ".join(parts)
-
-
-def redact_failure_text(message: object) -> str:
-    """只保留已知安全字段。无法识别时不回显原文。"""
-    if not isinstance(message, str):
-        return "phase=unspecified"
-    kept = []
-    for token in message.split():
-        if "=" not in token:
-            continue
-        key, value = token.split("=", 1)
-        rule = _SAFE_FAILURE_KEYS.get(key)
-        if rule is not None and rule.fullmatch(value):
-            kept.append(f"{key}={value}")
-    return " ".join(kept) if kept else "phase=unspecified"
 
 
 class WebsocketProtocol(Protocol):
@@ -80,38 +24,22 @@ class WebsocketProtocol(Protocol):
         )
         self.connected = False
         self.hello_received = None  # 初始化时先设为 None
+        self._handler_task = None
         self.WEBSOCKET_URL = self.config.get_config("NETWORK.WEBSOCKET_URL")
         self.WEBSOCKET_ACCESS_TOKEN = self.config.get_config(
             "NETWORK.WEBSOCKET_ACCESS_TOKEN"
         )
         self.CLIENT_ID = self.config.get_client_id()
         self.DEVICE_ID = self.config.get_device_id()
-        self._handler_task = None
-        self._reconnect_task = None
-        self._reconnect_attempts = 0
-        self._reconnect_stop = False
-        self._in_reconnect_loop = False
-        self._suppress_reader_reconnect = False
-        self._is_heartbeat_running = False
-        self._hello_timeout = 10.0
-        self._retry_base_s = None
-        self._last_failure = "phase=unknown"
-        self._connect_lock = asyncio.Lock()
 
     async def _close_websocket(self):
-        websocket = self.websocket
-        self.websocket = None
-        self.connected = False
-        if not websocket:
-            return
-        try:
-            await websocket.close()
-        except Exception as exc:
-            logger.warning(
-                "[xiaozhi-esp32-server] close failed "
-                f"{safe_ws_failure('close', exc)}",
-                module="xiaozhi-esp32-server",
-            )
+        if self.websocket:
+            try:
+                await self.websocket.close()
+                self.websocket = None
+                self.connected = False
+            except Exception:
+                pass
 
     async def _invoke_callback(self, callback, *args):
         """Run sync or async callbacks transparently."""
@@ -125,11 +53,6 @@ class WebsocketProtocol(Protocol):
 
     async def connect(self) -> bool:
         """连接到WebSocket服务器"""
-        async with self._connect_lock:
-            return await self._connect_locked()
-
-    async def _connect_locked(self) -> bool:
-        started = time.perf_counter()
         try:
             await self._close_websocket()
             self.WEBSOCKET_URL = self.config.get_config("NETWORK.WEBSOCKET_URL")
@@ -155,7 +78,9 @@ class WebsocketProtocol(Protocol):
                 uri=self.WEBSOCKET_URL, additional_headers=headers
             )
 
-            await self._cancel_handler()
+            # Cancel stale handler task from previous connection
+            if self._handler_task and not self._handler_task.done():
+                self._handler_task.cancel()
 
             # 启动消息处理循环
             self._handler_task = asyncio.create_task(self._message_handler())
@@ -176,51 +101,18 @@ class WebsocketProtocol(Protocol):
 
             # 等待服务器hello响应
             try:
-                await asyncio.wait_for(
-                    self.hello_received.wait(), timeout=self._hello_timeout
-                )
+                await asyncio.wait_for(self.hello_received.wait(), timeout=10.0)
                 self.connected = True
-                self._last_failure = "phase=ok"
                 logger.info(f"[xiaozhi-esp32-server] 连接 {self.WEBSOCKET_URL} 成功")
                 return True
             except asyncio.TimeoutError:
-                return await self._fail_connect("hello_timeout", None, started)
-        except Exception as exc:
-            return await self._fail_connect("connect", exc, started)
-
-    async def _fail_connect(self, phase: str, exc: BaseException | None, started: float) -> bool:
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        summary = safe_ws_failure(phase, exc, elapsed_ms)
-        self._last_failure = summary
-        logger.warning(
-            f"[xiaozhi-esp32-server] connect failed {summary}",
-            module="xiaozhi-esp32-server",
-        )
-        await self._cancel_handler()
-        await self._close_websocket()
-        if self.on_network_error and not self._in_reconnect_loop:
-            self.on_network_error(summary)
-        return False
-
-    async def _cancel_handler(self):
-        task = self._handler_task
-        self._handler_task = None
-        if task is None or task.done():
-            return
-        self._suppress_reader_reconnect = True
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.warning(
-                "[xiaozhi-esp32-server] reader cancel failed "
-                f"{safe_ws_failure('reader_cancel', exc)}",
-                module="xiaozhi-esp32-server",
-            )
-        finally:
-            self._suppress_reader_reconnect = False
+                if self.on_network_error:
+                    self.on_network_error("等待响应超时")
+                return False
+        except Exception as e:
+            if self.on_network_error:
+                self.on_network_error(f"无法连接服务: {str(e)}")
+            return False
 
     async def _message_handler(self):
         """处理接收到的WebSocket消息"""
@@ -245,22 +137,13 @@ class WebsocketProtocol(Protocol):
                         pass
                 elif self.on_incoming_audio:
                     self.on_incoming_audio(message)
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
-            if self._suppress_reader_reconnect:
-                return
-            summary = safe_ws_failure("reader", exc)
-            self._last_failure = summary
-            logger.warning(
-                f"[xiaozhi-esp32-server] reader stopped {summary}",
-                module="xiaozhi-esp32-server",
+            logger.error(
+                f"[xiaozhi-esp32-server] Message handler stopped: {type(exc).__name__}: {exc}"
             )
             self.connected = False
             if self.on_audio_channel_closed:
                 await self._invoke_callback(self.on_audio_channel_closed)
-            if not self._reconnect_stop:
-                self.ensure_reconnect()
 
     async def send_audio(self, frames: list[bytes]):
         """发送音频数据"""
@@ -272,8 +155,7 @@ class WebsocketProtocol(Protocol):
                 await self.websocket.send(frame)
         except Exception as exc:
             logger.error(
-                f"[xiaozhi-esp32-server] audio send failed {safe_ws_failure('send_audio', exc)}",
-                module="xiaozhi-esp32-server",
+                f"[xiaozhi-esp32-server] Failed to send audio: {type(exc).__name__}: {exc}"
             )
 
     async def send_text(self, message: str):
@@ -287,6 +169,8 @@ class WebsocketProtocol(Protocol):
     def is_audio_channel_opened(self) -> bool:
         """检查音频通道是否打开"""
         return self.websocket is not None and self.connected
+
+    _is_heartbeat_running = False
 
     async def open_audio_channel(self):
         if not self._is_heartbeat_running:
@@ -332,84 +216,45 @@ class WebsocketProtocol(Protocol):
             if self.on_audio_channel_opened:
                 await self._invoke_callback(self.on_audio_channel_opened)
 
-        except Exception as exc:
-            summary = safe_ws_failure("hello_parse", exc)
-            self._last_failure = summary
-            logger.warning(
-                f"[xiaozhi-esp32-server] hello failed {summary}",
-                module="xiaozhi-esp32-server",
-            )
-            if self.on_network_error and not self._in_reconnect_loop:
-                self.on_network_error(summary)
+        except Exception as e:
+            if self.on_network_error:
+                self.on_network_error(f"处理服务器响应失败: {str(e)}")
 
-    def _next_retry_delay(self) -> float:
-        if self._retry_base_s is not None:
-            return float(self._retry_base_s)
-        return float(min(5 * (2 ** (self._reconnect_attempts - 1)), 60))
-
-    def ensure_reconnect(self):
-        """保证最多一个重连任务。重复的失败回调直接并入当前任务。"""
-        if self._reconnect_stop or self.connected:
-            return
-        task = self._reconnect_task
-        if task is not None and not task.done():
-            return
-        self._reconnect_task = asyncio.get_running_loop().create_task(
-            self._reconnect_loop()
-        )
-
-    async def _reconnect_loop(self):
-        self._in_reconnect_loop = True
-        try:
-            while not self._reconnect_stop:
-                self._reconnect_attempts += 1
-                delay = self._next_retry_delay()
-                logger.info(
-                    "[xiaozhi-esp32-server] channel closed "
-                    f"retry_in_s={delay:.0f} attempt={self._reconnect_attempts} "
-                    f"{self._last_failure}",
-                    module="xiaozhi-esp32-server",
-                )
-                await asyncio.sleep(delay)
-                if self._reconnect_stop:
-                    return
-                if await self.connect():
-                    self._reconnect_attempts = 0
-                    return
-        except asyncio.CancelledError:
-            raise
-        finally:
-            self._in_reconnect_loop = False
-            current = asyncio.current_task()
-            if self._reconnect_task is current:
-                self._reconnect_task = None
+    _reconnect_attempts = 0
 
     async def close_audio_channel(self):
-        """关闭音频通道并停止重连。重连只由 ensure_reconnect 启动一次。"""
-        self._reconnect_stop = True
-        task = self._reconnect_task
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
+        """关闭音频通道"""
+        if self.websocket:
             try:
-                await task
-            except asyncio.CancelledError:
+                await self.websocket.close()
+                self.websocket = None
+                self.connected = False
+                if self.on_audio_channel_closed:
+                    await self._invoke_callback(self.on_audio_channel_closed)
+            except Exception:
                 pass
-        await self._cancel_handler()
-        await self._close_websocket()
-        if self.on_audio_channel_closed:
-            await self._invoke_callback(self.on_audio_channel_closed)
+
+        self._reconnect_attempts += 1
+        delay = min(5 * (2 ** (self._reconnect_attempts - 1)), 60)
+        logger.info(
+            f"[xiaozhi-esp32-server] {self.WEBSOCKET_URL} 通道被关闭, "
+            f"{delay}s 后尝试重连 (第 {self._reconnect_attempts} 次)..."
+        )
+        await asyncio.sleep(delay)
+        success = await self.connect()
+        if success:
+            self._reconnect_attempts = 0
 
     async def heartbeat(self):
-        while not self._reconnect_stop:
+        while True:
             if self.websocket and get_xiaozhi().device_state == DeviceState.IDLE:
                 try:
                     await self.websocket.ping()
-                except Exception as exc:
-                    summary = safe_ws_failure("heartbeat", exc)
-                    self._last_failure = summary
-                    logger.warning(
-                        f"[xiaozhi-esp32-server] heartbeat failed {summary}",
+                except Exception:
+                    logger.error(
+                        "发送心跳失败，准备重连",
                         module="xiaozhi-esp32-server",
                     )
-                    self.ensure_reconnect()
+                    # 发送心跳失败，重新连接
+                    await self.open_audio_channel()
             await asyncio.sleep(1)
