@@ -248,13 +248,22 @@ class XiaoZhi:
     # Protocol callbacks
 
     def _on_network_error(self, message):
-        """Handle network error."""
+        """记录安全摘要，并只启动一个重连任务。
+
+        先把状态打成 IDLE 再判断是否仍为 CONNECTING，会使判断恒真，
+        每次失败都再排一次 disconnect。disconnect 本身又会重连，
+        重复回调就会叠出多条重连循环。这里不再排 disconnect。
+        """
+        from core.services.protocols.websocket_protocol import redact_failure_text
+
+        logger.warning(
+            f"[XiaoZhi] network error {redact_failure_text(message)}",
+            module="XiaoZhi",
+        )
         self.set_device_state(DeviceState.IDLE)
-        if self.device_state != DeviceState.CONNECTING:
-            self.set_device_state(DeviceState.IDLE)
-            asyncio.run_coroutine_threadsafe(
-                self.disconnect(), self._app.loop
-            )
+        protocol = self.protocol
+        if protocol is not None and hasattr(protocol, "ensure_reconnect"):
+            protocol.ensure_reconnect()
 
     def _on_incoming_audio(self, data):
         """Handle incoming audio."""
